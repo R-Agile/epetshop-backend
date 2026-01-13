@@ -1,0 +1,341 @@
+from fastapi import APIRouter, HTTPException, status, Depends
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from typing import List
+from datetime import datetime, timedelta
+from bson import ObjectId
+import base64
+import json
+from app.models import (
+    UserCreate, UserResponse, UserUpdate, Token, LoginRequest
+)
+from app.database import get_database
+from app.auth import get_password_hash, verify_password, create_access_token, verify_token
+from app.database import settings
+
+router = APIRouter(prefix="/users", tags=["Users"])
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="users/login")
+
+
+def decrypt_data(encrypted: str, key: str = "pawstore_secret_key") -> str:
+    """Decrypt XOR encrypted data"""
+    data = base64.b64decode(encrypted).decode('latin-1')
+    result = ''
+    for i in range(len(data)):
+        result += chr(ord(data[i]) ^ ord(key[i % len(key)]))
+    return result
+
+
+def encrypt_data(data: str, key: str = "pawstore_secret_key") -> str:
+    """Encrypt data using XOR cipher"""
+    result = ''
+    for i in range(len(data)):
+        result += chr(ord(data[i]) ^ ord(key[i % len(key)]))
+    return base64.b64encode(result.encode('latin-1')).decode('utf-8')
+
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    payload = verify_token(token)
+    if payload is None:
+        raise credentials_exception
+    username: str = payload.get("sub")
+    if username is None:
+        raise credentials_exception
+    
+    db = await get_database()
+    user = await db.users.find_one({"username": username})
+    if user is None:
+        raise credentials_exception
+    return user
+
+
+@router.post("/register", response_model=Token, status_code=status.HTTP_201_CREATED)
+async def register_user(user: UserCreate):
+    db = await get_database()
+    
+    # Check if user already exists
+    existing_user = await db.users.find_one({"$or": [{"email": user.email}, {"username": user.username}]})
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User with this email or username already exists"
+        )
+    
+    # Create new user
+    user_dict = {
+        "username": user.username,
+        "email": user.email,
+        "full_name": user.full_name,
+        "password_hash": get_password_hash(user.password),
+        "role": user.role,
+        "status": "active",
+        "register_time": datetime.utcnow(),
+        "last_login_time": None
+    }
+    
+    result = await db.users.insert_one(user_dict)
+    user_id = str(result.inserted_id)
+    
+    # Create access token for auto-login after registration
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "_id": user_id,
+            "username": user.username,
+            "email": user.email,
+            "full_name": user.full_name,
+            "role": user.role
+        }
+    }
+
+
+@router.post("/login")
+async def login(login_data: LoginRequest):
+    db = await get_database()
+    
+    # Handle encrypted credentials
+    if login_data.encrypted:
+        try:
+            decrypted = decrypt_data(login_data.encrypted)
+            credentials = json.loads(decrypted)
+            email = credentials.get('email')
+            password = credentials.get('password')
+        except Exception as e:
+            print(f"Decryption error: {e}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid encrypted data: {str(e)}",
+            )
+    else:
+        # Fallback to plain credentials (for backward compatibility)
+        email = login_data.email
+        password = login_data.password
+    
+    if not email or not password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email and password are required",
+        )
+    
+    # Find user by email
+    user = await db.users.find_one({"email": email.lower()})
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Check if user is banned
+    if user.get("status") == "banned":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account has been banned. Please contact support.",
+        )
+    
+    # Verify password
+    if not verify_password(password, user["password_hash"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Update last login time
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"last_login_time": datetime.utcnow()}}
+    )
+    
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user["username"]}, expires_delta=access_token_expires
+    )
+    
+    # Prepare response data
+    response_data = {
+        "access_token": access_token, 
+        "token_type": "bearer",
+        "user": {
+            "_id": str(user["_id"]),
+            "username": user["username"],
+            "email": user["email"],
+            "full_name": user["full_name"],
+            "role": user["role"],
+            "status": user.get("status", "active")
+        }
+    }
+    
+    # Encrypt response data
+    encrypted_response = encrypt_data(json.dumps(response_data))
+    
+    return {
+        "encrypted_response": encrypted_response
+    }
+
+
+@router.post("/login-plain")
+async def login_plain(login_data: LoginRequest):
+    """Temporary endpoint for testing without encryption"""
+    db = await get_database()
+    
+    email = login_data.email
+    password = login_data.password
+    
+    if not email or not password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email and password are required",
+        )
+    
+    # Find user by email
+    user = await db.users.find_one({"email": email.lower()})
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+        )
+    
+    # Verify password
+    if not verify_password(password, user["password_hash"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+        )
+    
+    # Update last login time
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"last_login_time": datetime.utcnow()}}
+    )
+    
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user["username"]}, expires_delta=access_token_expires
+    )
+    
+    return {
+        "access_token": access_token, 
+        "token_type": "bearer",
+        "user": {
+            "_id": str(user["_id"]),
+            "username": user["username"],
+            "email": user["email"],
+            "full_name": user["full_name"],
+            "role": user["role"],
+            "status": user.get("status", "active")
+        }
+    }
+
+
+@router.get("/me", response_model=UserResponse)
+async def get_current_user_info(current_user: dict = Depends(get_current_user)):
+    current_user["_id"] = str(current_user["_id"])
+    return UserResponse(**current_user)
+
+
+@router.get("/", response_model=List[UserResponse])
+async def get_all_users(current_user: dict = Depends(get_current_user)):
+    # Only super_user can see all users
+    if current_user.get("role") not in ["super_user", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized. Admin access required.")
+    
+    db = await get_database()
+    users = await db.users.find().to_list(1000)
+    
+    for user in users:
+        user["_id"] = str(user["_id"])
+    
+    return [UserResponse(**user) for user in users]
+
+
+@router.get("/{user_id}", response_model=UserResponse)
+async def get_user(user_id: str, current_user: dict = Depends(get_current_user)):
+    db = await get_database()
+    
+    if not ObjectId.is_valid(user_id):
+        raise HTTPException(status_code=400, detail="Invalid user ID")
+    
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user["_id"] = str(user["_id"])
+    return UserResponse(**user)
+
+
+@router.put("/{user_id}", response_model=UserResponse)
+async def update_user(
+    user_id: str,
+    user_update: UserUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    db = await get_database()
+    
+    if not ObjectId.is_valid(user_id):
+        raise HTTPException(status_code=400, detail="Invalid user ID")
+    
+    # Check if user is admin
+    if current_user.get("role") not in ["super_user", "admin"]:
+        raise HTTPException(status_code=403, detail="Only admin can update users")
+    
+    # Get current user data
+    existing_user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not existing_user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    update_data = {k: v for k, v in user_update.dict(exclude_unset=True).items()}
+    
+    if update_data:
+        print(f"Updating user {user_id}")
+        print(f"Update data: {update_data}")
+        print(f"Old status: {existing_user.get('status')}")
+        
+        result = await db.users.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": update_data}
+        )
+        
+        print(f"Matched: {result.matched_count}, Modified: {result.modified_count}")
+        
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        if result.modified_count == 0:
+            print("No changes made (status might be same)")
+    
+    # Get updated user
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    print(f"New status: {user.get('status')}")
+    
+    user["_id"] = str(user["_id"])
+    return UserResponse(**user)
+
+
+@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_user(user_id: str, current_user: dict = Depends(get_current_user)):
+    db = await get_database()
+    
+    if not ObjectId.is_valid(user_id):
+        raise HTTPException(status_code=400, detail="Invalid user ID")
+    
+    result = await db.users.delete_one({"_id": ObjectId(user_id)})
+    
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return None
