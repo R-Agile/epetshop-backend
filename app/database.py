@@ -1,17 +1,18 @@
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic_settings import BaseSettings
+from typing import Optional
 import os
 
 
 class Settings(BaseSettings):
     # These values are read from environment variables first, then .env file, then defaults
     # For Railway deployment: Set these in Railway's Variables tab
-    MONGODB_URL: str = "mongodb://localhost:27017"
-    DATABASE_NAME: str = "epet_db"
-    SECRET_KEY: str = "CHANGE_THIS_IN_PRODUCTION"
-    ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
-    FRONTEND_URL: str = "http://localhost:5173"
+    MONGODB_URL: str = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
+    DATABASE_NAME: str = os.getenv("DATABASE_NAME", "epet_db")
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "CHANGE_THIS_IN_PRODUCTION")
+    ALGORITHM: str = os.getenv("ALGORITHM", "HS256")
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
+    FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
     class Config:
         env_file = ".env"
@@ -23,8 +24,7 @@ settings = Settings()
 
 
 class Database:
-    def __init__(self):
-        self.client = None
+    client: Optional[AsyncIOMotorClient] = None
     
 
 db = Database()
