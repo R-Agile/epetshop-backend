@@ -240,6 +240,28 @@ async def update_order(
             raise HTTPException(status_code=400, detail="Invalid status")
         if current_status in terminal_statuses and new_status != current_status:
             raise HTTPException(status_code=400, detail="Cannot change status after it is delivered or cancelled")
+        
+        # If order is being cancelled, restore inventory stock
+        if new_status == "cancelled" and current_status != "cancelled":
+            print(f"[INFO] Order {order_id} being cancelled, restoring inventory stock")
+            
+            # Get all order items for this order
+            order_items = await db.order_items.find({"order_id": order_id}).to_list(1000)
+            
+            # Restore stock for each item
+            for order_item in order_items:
+                inventory_id = order_item.get("inventory_id")
+                quantity = order_item.get("quantity", 0)
+                
+                if inventory_id and ObjectId.is_valid(inventory_id):
+                    inventory = await db.inventory.find_one({"_id": ObjectId(inventory_id)})
+                    if inventory:
+                        new_stock = inventory["stock"] + quantity
+                        await db.inventory.update_one(
+                            {"_id": ObjectId(inventory_id)},
+                            {"$set": {"stock": new_stock}}
+                        )
+                        print(f"[INFO] Restored {quantity} units to inventory {inventory_id}, new stock: {new_stock}")
     
     # If already terminal and no other fields to update, just return current order
     if current_status in terminal_statuses and (not update_data or (len(update_data) == 1 and "status" in update_data)):
