@@ -40,3 +40,21 @@ async def close_mongo_connection():
     if db.client:
         db.client.close()
         print("Closed connection to MongoDB")
+
+
+async def get_user_order_summary(user_id: str):
+    """Get total orders and total spent for a user"""
+    database = await get_database()
+    
+    # Get total number of orders
+    total_orders = await database.orders.count_documents({"user_id": user_id})
+    
+    # Get total amount spent by aggregating all orders
+    pipeline = [
+        {"$match": {"user_id": user_id}},
+        {"$group": {"_id": None, "total_spent": {"$sum": "$total"}}}
+    ]
+    result = await database.orders.aggregate(pipeline).to_list(1)
+    total_spent = result[0]["total_spent"] if result else 0.0
+    
+    return {"total_orders": total_orders, "total_spent": total_spent}

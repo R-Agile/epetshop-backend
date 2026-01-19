@@ -7,8 +7,13 @@ from app.models import (
 )
 from app.database import get_database
 from app.routes.users import get_current_user
+from pydantic import BaseModel
 
 router = APIRouter(prefix="/cart", tags=["Cart"])
+
+# Model for guest cart sync
+class CartSyncRequest(BaseModel):
+    items: List[dict]
 
 
 @router.get("/", response_model=CartResponse)
@@ -172,3 +177,94 @@ async def clear_cart(current_user: dict = Depends(get_current_user)):
     await db.cart_items.delete_many({"cart_id": cart_id})
     
     return None
+
+
+# ============= GUEST CART ENDPOINTS (GuestId Based) =============
+
+@router.get("/{guest_id}")
+async def get_guest_cart(guest_id: str):
+    """Get cart items for a guest using guestId"""
+    db = await get_database()
+    
+    # Find guest cart
+    cart = await db.carts.find_one({"guest_id": guest_id})
+    
+    if not cart:
+        return {"items": []}
+    
+    # Get cart items
+    cart_items = await db.cart_items.find({"cart_id": str(cart["_id"])}).to_list(1000)
+    
+    # Format items with product details
+    formatted_items = []
+    for item in cart_items:
+        formatted_items.append({
+            "id": str(item["_id"]),
+            "product_id": item.get("inventory_id"),
+            "quantity": item.get("quantity", 1),
+            "product": item.get("product", {})
+        })
+    
+    return {"items": formatted_items}
+
+
+@router.post("/{guest_id}/sync")
+async def sync_guest_cart(guest_id: str, request: CartSyncRequest):
+    """Sync guest cart items to database"""
+    db = await get_database()
+    from datetime import datetime
+    
+    try:
+        # Get or create cart for guest
+        cart = await db.carts.find_one({"guest_id": guest_id})
+        
+        if not cart:
+            # Create new guest cart
+            cart_dict = {
+                "guest_id": guest_id,
+                "user_id": None,
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow()
+            }
+            result = await db.carts.insert_one(cart_dict)
+            cart_id = str(result.inserted_id)
+        else:
+            cart_id = str(cart["_id"])
+            # Update timestamp
+            await db.carts.update_one(
+                {"_id": ObjectId(cart_id)},
+                {"$set": {"updated_at": datetime.utcnow()}}
+            )
+        
+        # Clear existing items
+        await db.cart_items.delete_many({"cart_id": cart_id})
+        
+        # Add new items
+        for item in request.items:
+            cart_item = {
+                "cart_id": cart_id,
+                "inventory_id": item.get("product", {}).get("id"),
+                "product": item.get("product", {}),
+                "quantity": item.get("quantity", 1),
+                "created_at": datetime.utcnow()
+            }
+            await db.cart_items.insert_one(cart_item)
+        
+        return {"status": "success", "message": "Cart synced to database"}
+    
+    except Exception as e:
+        print(f"Error syncing cart: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+
+@router.delete("/{guest_id}")
+async def clear_guest_cart(guest_id: str):
+    """Clear guest cart"""
+    db = await get_database()
+    
+    cart = await db.carts.find_one({"guest_id": guest_id})
+    if cart:
+        cart_id = str(cart["_id"])
+        await db.cart_items.delete_many({"cart_id": cart_id})
+    
+    return {"status": "success"}

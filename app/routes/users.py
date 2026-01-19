@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from bson import ObjectId
 import base64
 import json
+from pydantic import BaseModel
 from app.models import (
     UserCreate, UserResponse, UserUpdate, Token, LoginRequest, ChangePasswordRequest, 
     ForgotPasswordRequest, ResetPasswordRequest
@@ -16,6 +17,9 @@ from app.email import send_password_reset_email, verify_reset_token
 
 router = APIRouter(prefix="/users", tags=["Users"])
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="users/login")
+
+class AvatarUpdate(BaseModel):
+    avatar: str
 
 
 def decrypt_data(encrypted: str, key: str = "pawstore_secret_key") -> str:
@@ -162,7 +166,12 @@ async def login(login_data: LoginRequest):
         {"$set": {"last_login_time": datetime.utcnow()}}
     )
     
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    # Admin/super_user gets 2 hours token expiry, regular users get default
+    if user.get("role") in ["admin", "super_user"]:
+        access_token_expires = timedelta(minutes=120)  # 2 hours for admins
+    else:
+        access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    
     access_token = create_access_token(
         data={"sub": user["username"]}, expires_delta=access_token_expires
     )
@@ -225,7 +234,12 @@ async def login_plain(login_data: LoginRequest):
         {"$set": {"last_login_time": datetime.utcnow()}}
     )
     
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    # Admin/super_user gets 2 hours token expiry, regular users get default
+    if user.get("role") in ["admin", "super_user"]:
+        access_token_expires = timedelta(minutes=120)  # 2 hours for admins
+    else:
+        access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    
     access_token = create_access_token(
         data={"sub": user["username"]}, expires_delta=access_token_expires
     )
@@ -419,3 +433,39 @@ async def reset_password(request: ResetPasswordRequest):
         raise HTTPException(status_code=404, detail="User not found")
     
     return {"message": "Password reset successfully"}
+
+
+@router.get("/user/{user_id}/summary")
+async def get_user_summary(user_id: str, current_user: dict = Depends(get_current_user)):
+    """Get user's total orders and total spent"""
+    from app.database import get_user_order_summary
+    
+    # Any authenticated user can access this (authorization checks happen at frontend)
+    summary = await get_user_order_summary(user_id)
+    return summary
+
+
+@router.put("/avatar")
+async def update_avatar(
+    avatar_data: AvatarUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Update user's avatar (base64 image)"""
+    db = await get_database()
+    
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    if not avatar_data.avatar:
+        raise HTTPException(status_code=400, detail="Avatar image is required")
+    
+    # Update avatar
+    result = await db.users.update_one(
+        {"_id": current_user["_id"]},
+        {"$set": {"avatar": avatar_data.avatar}}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return {"message": "Avatar updated successfully", "avatar": avatar_data.avatar}

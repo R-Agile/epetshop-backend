@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, status, Depends
 from typing import List
 from bson import ObjectId
+from datetime import datetime
 from app.models import WishlistItemCreate, WishlistItemResponse
 from app.database import get_database
 from app.routes.users import get_current_user
@@ -90,3 +91,50 @@ async def remove_inventory_from_wishlist(inventory_id: str, current_user: dict =
         raise HTTPException(status_code=404, detail="Item not in wishlist")
     
     return None
+
+
+# Guest wishlist endpoints (for anonymous users)
+@router.get("/guest/{guest_id}")
+async def get_guest_wishlist(guest_id: str):
+    """Get wishlist for a guest user"""
+    db = await get_database()
+    
+    guest_wishlist = await db.guest_wishlists.find_one({"guest_id": guest_id})
+    
+    if not guest_wishlist:
+        return {"items": []}
+    
+    return {"items": guest_wishlist.get("items", [])}
+
+
+@router.post("/guest/{guest_id}/sync")
+async def sync_guest_wishlist(guest_id: str, payload: dict):
+    """Sync guest wishlist to database"""
+    db = await get_database()
+    
+    items = payload.get("items", [])
+    
+    # Create or update guest wishlist
+    result = await db.guest_wishlists.update_one(
+        {"guest_id": guest_id},
+        {
+            "$set": {
+                "guest_id": guest_id,
+                "items": items,
+                "updated_at": datetime.utcnow()
+            }
+        },
+        upsert=True
+    )
+    
+    return {"success": True, "items": items}
+
+
+@router.delete("/guest/{guest_id}")
+async def clear_guest_wishlist(guest_id: str):
+    """Clear guest wishlist"""
+    db = await get_database()
+    
+    await db.guest_wishlists.delete_one({"guest_id": guest_id})
+    
+    return {"success": True}
